@@ -14,16 +14,16 @@
 # limitations under the License.
 """Testing suite for the PyTorch LayoutLMv2 model."""
 
-import unittest
 
-from transformers.testing_utils import (
-    require_detectron2,
-    require_non_xpu,
-    require_torch,
-    require_torch_multi_gpu,
-    slow,
-    torch_device,
-)
+import copy
+import os
+import random
+import tempfile
+import unittest
+from typing import Dict, List, Tuple
+
+from transformers.models.auto import get_values
+from transformers.testing_utils import require_detectron2, require_torch, require_torch_multi_gpu, slow, torch_device
 from transformers.utils import is_detectron2_available, is_torch_available
 
 from ...test_configuration_common import ConfigTester
@@ -36,11 +36,12 @@ if is_torch_available():
     import torch.nn.functional as F
 
     from transformers import (
-        LayoutLMv2Config,
-        LayoutLMv2ForQuestionAnswering,
-        LayoutLMv2ForSequenceClassification,
-        LayoutLMv2ForTokenClassification,
-        LayoutLMv2Model,
+        MODEL_FOR_DOCUMENT_QUESTION_ANSWERING_MAPPING,
+        MODEL_FOR_QUESTION_ANSWERING_MAPPING,
+        MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING,
+        MODEL_FOR_TOKEN_CLASSIFICATION_MAPPING,
+        MODEL_MAPPING,
+        LayoutLMv2ForRelationExtraction,
     )
 
 if is_detectron2_available():
@@ -54,7 +55,7 @@ class LayoutLMv2ModelTester:
         batch_size=2,
         num_channels=3,
         image_size=4,
-        seq_length=7,
+        text_seq_length=7,
         is_training=True,
         use_input_mask=True,
         use_token_type_ids=True,
@@ -83,7 +84,7 @@ class LayoutLMv2ModelTester:
         self.batch_size = batch_size
         self.num_channels = num_channels
         self.image_size = image_size
-        self.seq_length = seq_length
+        self.text_seq_length = text_seq_length
         self.is_training = is_training
         self.use_input_mask = use_input_mask
         self.use_token_type_ids = use_token_type_ids
@@ -108,10 +109,13 @@ class LayoutLMv2ModelTester:
         self.scope = scope
         self.range_bbox = range_bbox
 
-    def prepare_config_and_inputs(self):
-        input_ids = ids_tensor([self.batch_size, self.seq_length], self.vocab_size)
+        # in LayoutLMv2, the seq length equals the number of text tokens + number of image tokens
+        self.seq_length = self.text_seq_length + self.image_feature_pool_shape[0] * self.image_feature_pool_shape[1]
 
-        bbox = ids_tensor([self.batch_size, self.seq_length, 4], self.range_bbox)
+    def prepare_config_and_inputs(self):
+        input_ids = ids_tensor([self.batch_size, self.text_seq_length], self.vocab_size)
+
+        bbox = ids_tensor([self.batch_size, self.text_seq_length, 4], self.range_bbox)
         # Ensure that bbox is legal
         for i in range(bbox.shape[0]):
             for j in range(bbox.shape[1]):
@@ -131,17 +135,24 @@ class LayoutLMv2ModelTester:
 
         input_mask = None
         if self.use_input_mask:
-            input_mask = random_attention_mask([self.batch_size, self.seq_length])
+            input_mask = random_attention_mask([self.batch_size, self.text_seq_length])
 
         token_type_ids = None
         if self.use_token_type_ids:
-            token_type_ids = ids_tensor([self.batch_size, self.seq_length], self.type_vocab_size)
+            token_type_ids = ids_tensor([self.batch_size, self.text_seq_length], self.type_vocab_size)
 
         sequence_labels = None
         token_labels = None
+        entities = None
+        relations = None
         if self.use_labels:
             sequence_labels = ids_tensor([self.batch_size], self.type_sequence_label_size)
-            token_labels = ids_tensor([self.batch_size, self.seq_length], self.num_labels)
+            token_labels = ids_tensor([self.batch_size, self.text_seq_length], self.num_labels)
+            # we choose some random entities and relations
+            entities = [{"start": [0, 4], "end": [3, 6], "label": [2, 1]} for _ in range(self.batch_size)]
+            relations = [
+                {"start_index": [0], "end_index": [5], "head": [0], "tail": [1]} for _ in range(self.batch_size)
+            ]
 
         config = LayoutLMv2Config(
             vocab_size=self.vocab_size,
@@ -166,10 +177,31 @@ class LayoutLMv2ModelTester:
         config.detectron2_config_args["MODEL.RESNETS.RES2_OUT_CHANNELS"] = 64
         config.detectron2_config_args["MODEL.RESNETS.NUM_GROUPS"] = 1
 
-        return config, input_ids, bbox, image, token_type_ids, input_mask, sequence_labels, token_labels
+        return (
+            config,
+            input_ids,
+            bbox,
+            image,
+            token_type_ids,
+            input_mask,
+            sequence_labels,
+            token_labels,
+            entities,
+            relations,
+        )
 
     def create_and_check_model(
-        self, config, input_ids, bbox, image, token_type_ids, input_mask, sequence_labels, token_labels
+        self,
+        config,
+        input_ids,
+        bbox,
+        image,
+        token_type_ids,
+        input_mask,
+        sequence_labels,
+        token_labels,
+        entities,
+        relations,
     ):
         model = LayoutLMv2Model(config=config)
         model.to(torch_device)
@@ -179,13 +211,21 @@ class LayoutLMv2ModelTester:
         result = model(input_ids, bbox=bbox, image=image, token_type_ids=token_type_ids)
         result = model(input_ids, bbox=bbox, image=image)
 
-        # LayoutLMv2 has a different expected sequence length, namely also visual tokens are added
-        expected_seq_len = self.seq_length + self.image_feature_pool_shape[0] * self.image_feature_pool_shape[1]
-        self.parent.assertEqual(result.last_hidden_state.shape, (self.batch_size, expected_seq_len, self.hidden_size))
+        self.parent.assertEqual(result.last_hidden_state.shape, (self.batch_size, self.seq_length, self.hidden_size))
         self.parent.assertEqual(result.pooler_output.shape, (self.batch_size, self.hidden_size))
 
     def create_and_check_for_sequence_classification(
-        self, config, input_ids, bbox, image, token_type_ids, input_mask, sequence_labels, token_labels
+        self,
+        config,
+        input_ids,
+        bbox,
+        image,
+        token_type_ids,
+        input_mask,
+        sequence_labels,
+        token_labels,
+        entities,
+        relations,
     ):
         config.num_labels = self.num_labels
         model = LayoutLMv2ForSequenceClassification(config)
@@ -202,7 +242,17 @@ class LayoutLMv2ModelTester:
         self.parent.assertEqual(result.logits.shape, (self.batch_size, self.num_labels))
 
     def create_and_check_for_token_classification(
-        self, config, input_ids, bbox, image, token_type_ids, input_mask, sequence_labels, token_labels
+        self,
+        config,
+        input_ids,
+        bbox,
+        image,
+        token_type_ids,
+        input_mask,
+        sequence_labels,
+        token_labels,
+        entities,
+        relations,
     ):
         config.num_labels = self.num_labels
         model = LayoutLMv2ForTokenClassification(config=config)
@@ -216,10 +266,20 @@ class LayoutLMv2ModelTester:
             token_type_ids=token_type_ids,
             labels=token_labels,
         )
-        self.parent.assertEqual(result.logits.shape, (self.batch_size, self.seq_length, self.num_labels))
+        self.parent.assertEqual(result.logits.shape, (self.batch_size, self.text_seq_length, self.num_labels))
 
     def create_and_check_for_question_answering(
-        self, config, input_ids, bbox, image, token_type_ids, input_mask, sequence_labels, token_labels
+        self,
+        config,
+        input_ids,
+        bbox,
+        image,
+        token_type_ids,
+        input_mask,
+        sequence_labels,
+        token_labels,
+        entities,
+        relations,
     ):
         model = LayoutLMv2ForQuestionAnswering(config=config)
         model.to(torch_device)
@@ -233,8 +293,35 @@ class LayoutLMv2ModelTester:
             start_positions=sequence_labels,
             end_positions=sequence_labels,
         )
-        self.parent.assertEqual(result.start_logits.shape, (self.batch_size, self.seq_length))
-        self.parent.assertEqual(result.end_logits.shape, (self.batch_size, self.seq_length))
+        self.parent.assertEqual(result.start_logits.shape, (self.batch_size, self.text_seq_length))
+        self.parent.assertEqual(result.end_logits.shape, (self.batch_size, self.text_seq_length))
+
+    def create_and_check_for_relation_extraction(
+        self,
+        config,
+        input_ids,
+        bbox,
+        image,
+        token_type_ids,
+        input_mask,
+        sequence_labels,
+        token_labels,
+        entities,
+        relations,
+    ):
+        model = LayoutLMv2ForRelationExtraction(config=config)
+        model.to(torch_device)
+        model.eval()
+        result = model(
+            input_ids,
+            bbox=bbox,
+            image=image,
+            attention_mask=input_mask,
+            token_type_ids=token_type_ids,
+            entities=entities,
+            relations=relations,
+        )
+        self.parent.assertTrue(result.pred_relations)
 
     def prepare_config_and_inputs_for_common(self):
         config_and_inputs = self.prepare_config_and_inputs()
@@ -247,6 +334,8 @@ class LayoutLMv2ModelTester:
             input_mask,
             sequence_labels,
             token_labels,
+            entities,
+            relations,
         ) = config_and_inputs
         inputs_dict = {
             "input_ids": input_ids,
@@ -272,6 +361,7 @@ class LayoutLMv2ModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCa
             LayoutLMv2ForSequenceClassification,
             LayoutLMv2ForTokenClassification,
             LayoutLMv2ForQuestionAnswering,
+            LayoutLMv2ForRelationExtraction,
         )
         if is_torch_available()
         else ()
@@ -281,6 +371,44 @@ class LayoutLMv2ModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCa
         if is_torch_available()
         else {}
     )
+
+    def _prepare_for_class(self, inputs_dict, model_class, return_labels=False):
+        inputs_dict = copy.deepcopy(inputs_dict)
+
+        if model_class.__name__ == "LayoutLMv2ForRelationExtraction":
+            # we choose some random entities and relations
+            entities = [{"start": [0, 4], "end": [3, 6], "label": [2, 1]} for _ in range(self.model_tester.batch_size)]
+            relations = [
+                {"start_index": [0], "end_index": [5], "head": [0], "tail": [1]}
+                for _ in range(self.model_tester.batch_size)
+            ]
+            inputs_dict["entities"] = entities
+            inputs_dict["relations"] = relations
+
+        if return_labels:
+            if model_class in [
+                *get_values(MODEL_FOR_QUESTION_ANSWERING_MAPPING),
+                *get_values(MODEL_FOR_DOCUMENT_QUESTION_ANSWERING_MAPPING),
+            ]:
+
+                inputs_dict["start_positions"] = torch.zeros(
+                    self.model_tester.batch_size, dtype=torch.long, device=torch_device
+                )
+                inputs_dict["end_positions"] = torch.zeros(
+                    self.model_tester.batch_size, dtype=torch.long, device=torch_device
+                )
+            elif model_class in get_values(MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING):
+                inputs_dict["labels"] = torch.zeros(
+                    self.model_tester.batch_size, dtype=torch.long, device=torch_device
+                )
+            elif model_class in get_values(MODEL_FOR_TOKEN_CLASSIFICATION_MAPPING):
+                inputs_dict["labels"] = torch.zeros(
+                    (self.model_tester.batch_size, self.model_tester.text_seq_length),
+                    dtype=torch.long,
+                    device=torch_device,
+                )
+
+        return inputs_dict
 
     def setUp(self):
         self.model_tester = LayoutLMv2ModelTester(self)
@@ -321,106 +449,106 @@ class LayoutLMv2ModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCa
         config_and_inputs = self.model_tester.prepare_config_and_inputs()
         self.model_tester.create_and_check_for_question_answering(*config_and_inputs)
 
+    def test_for_relation_extraction(self):
+        config_and_inputs = self.model_tester.prepare_config_and_inputs()
+        self.model_tester.create_and_check_for_relation_extraction(*config_and_inputs)
+
+    def test_save_load_fast_init_from_base(self):
+        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
+        base_class = MODEL_MAPPING[config.__class__]
+
+        if isinstance(base_class, tuple):
+            base_class = base_class[0]
+
+        for model_class in self.all_model_classes:
+            if model_class == base_class:
+                continue
+
+            # make a copy of model class to not break future tests
+            # from https://stackoverflow.com/questions/9541025/how-to-copy-a-python-class
+            class CopyClass(model_class):
+                pass
+
+            model_class_copy = CopyClass
+
+            # make sure that all keys are expected for test
+            model_class_copy._keys_to_ignore_on_load_missing = []
+
+            # make init deterministic, but make sure that
+            # non-initialized weights throw errors nevertheless
+            model_class_copy._init_weights = self._mock_init_weights
+
+            model = base_class(config)
+            state_dict = model.state_dict()
+
+            # this will often delete a single weight of a multi-weight module
+            # to test an edge case
+            random_key_to_del = random.choice(list(state_dict.keys()))
+            del state_dict[random_key_to_del]
+
+            # check that certain keys didn't get saved with the model
+            with tempfile.TemporaryDirectory() as tmpdirname:
+                model.save_pretrained(tmpdirname)
+                torch.save(state_dict, os.path.join(tmpdirname, "pytorch_model.bin"))
+
+                model_fast_init = model_class_copy.from_pretrained(tmpdirname)
+                model_slow_init = model_class_copy.from_pretrained(tmpdirname, _fast_init=False)
+
+                for key in model_fast_init.state_dict().keys():
+                    if key == "layoutlmv2.visual_segment_embedding":
+                        # we skip the visual segment embedding as it has a custom initialization scheme
+                        continue
+                    max_diff = (model_slow_init.state_dict()[key] - model_fast_init.state_dict()[key]).sum().item()
+                    self.assertLessEqual(max_diff, 1e-3, msg=f"{key} not identical")
+
     def test_attention_outputs(self):
         config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
-        config.return_dict = True
+        base_class = MODEL_MAPPING[config.__class__]
 
-        # LayoutLMv2 has a different expected sequence length
-        expected_seq_len = (
-            self.model_tester.seq_length
-            + self.model_tester.image_feature_pool_shape[0] * self.model_tester.image_feature_pool_shape[1]
-        )
+        if isinstance(base_class, tuple):
+            base_class = base_class[0]
 
         for model_class in self.all_model_classes:
-            inputs_dict["output_attentions"] = True
-            inputs_dict["output_hidden_states"] = False
-            config.return_dict = True
+
+            if model_class == base_class:
+                continue
+
+            # make a copy of model class to not break future tests
+            # from https://stackoverflow.com/questions/9541025/how-to-copy-a-python-class
+            class CopyClass(base_class):
+                pass
+
+            base_class_copy = CopyClass
+
+            # make sure that all keys are expected for test
+            base_class_copy._keys_to_ignore_on_load_missing = []
+
+            # make init deterministic, but make sure that
+            # non-initialized weights throw errors nevertheless
+            base_class_copy._init_weights = self._mock_init_weights
+
             model = model_class(config)
-            model.to(torch_device)
-            model.eval()
-            with torch.no_grad():
-                outputs = model(**self._prepare_for_class(inputs_dict, model_class))
-            attentions = outputs.attentions
-            self.assertEqual(len(attentions), self.model_tester.num_hidden_layers)
+            state_dict = model.state_dict()
 
-            # check that output_attentions also work using config
-            del inputs_dict["output_attentions"]
-            config.output_attentions = True
-            model = model_class(config)
-            model.to(torch_device)
-            model.eval()
-            with torch.no_grad():
-                outputs = model(**self._prepare_for_class(inputs_dict, model_class))
-            attentions = outputs.attentions
-            self.assertEqual(len(attentions), self.model_tester.num_hidden_layers)
+            # this will often delete a single weight of a multi-weight module
+            # to test an edge case
+            random_key_to_del = random.choice(list(state_dict.keys()))
+            del state_dict[random_key_to_del]
 
-            self.assertListEqual(
-                list(attentions[0].shape[-3:]),
-                [self.model_tester.num_attention_heads, expected_seq_len, expected_seq_len],
-            )
-            out_len = len(outputs)
+            # check that certain keys didn't get saved with the model
+            with tempfile.TemporaryDirectory() as tmpdirname:
+                model.config.save_pretrained(tmpdirname)
+                torch.save(state_dict, os.path.join(tmpdirname, "pytorch_model.bin"))
 
-            # Check attention is always last and order is fine
-            inputs_dict["output_attentions"] = True
-            inputs_dict["output_hidden_states"] = True
-            model = model_class(config)
-            model.to(torch_device)
-            model.eval()
-            with torch.no_grad():
-                outputs = model(**self._prepare_for_class(inputs_dict, model_class))
+                model_fast_init = base_class_copy.from_pretrained(tmpdirname)
+                model_slow_init = base_class_copy.from_pretrained(tmpdirname, _fast_init=False)
 
-            if hasattr(self.model_tester, "num_hidden_states_types"):
-                added_hidden_states = self.model_tester.num_hidden_states_types
-            else:
-                added_hidden_states = 1
-            self.assertEqual(out_len + added_hidden_states, len(outputs))
-
-            self_attentions = outputs.attentions
-
-            self.assertEqual(len(self_attentions), self.model_tester.num_hidden_layers)
-            self.assertListEqual(
-                list(self_attentions[0].shape[-3:]),
-                [self.model_tester.num_attention_heads, expected_seq_len, expected_seq_len],
-            )
-
-    def test_hidden_states_output(self):
-        def check_hidden_states_output(inputs_dict, config, model_class):
-            model = model_class(config)
-            model.to(torch_device)
-            model.eval()
-
-            with torch.no_grad():
-                outputs = model(**self._prepare_for_class(inputs_dict, model_class))
-
-            hidden_states = outputs.hidden_states
-
-            expected_num_layers = getattr(
-                self.model_tester, "expected_num_hidden_layers", self.model_tester.num_hidden_layers + 1
-            )
-            self.assertEqual(len(hidden_states), expected_num_layers)
-
-            # LayoutLMv2 has a different expected sequence length
-            expected_seq_len = (
-                self.model_tester.seq_length
-                + self.model_tester.image_feature_pool_shape[0] * self.model_tester.image_feature_pool_shape[1]
-            )
-
-            self.assertListEqual(
-                list(hidden_states[0].shape[-2:]),
-                [expected_seq_len, self.model_tester.hidden_size],
-            )
-
-        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
-
-        for model_class in self.all_model_classes:
-            inputs_dict["output_hidden_states"] = True
-            check_hidden_states_output(inputs_dict, config, model_class)
-
-            # check that output_hidden_states also work using config
-            del inputs_dict["output_hidden_states"]
-            config.output_hidden_states = True
-
-            check_hidden_states_output(inputs_dict, config, model_class)
+                for key in model_fast_init.state_dict().keys():
+                    if key == "layoutlmv2.visual_segment_embedding":
+                        # we skip the visual segment embedding as it has a custom initialization scheme
+                        continue
+                    max_diff = (model_slow_init.state_dict()[key] - model_fast_init.state_dict()[key]).sum().item()
+                    self.assertLessEqual(max_diff, 1e-3, msg=f"{key} not identical")
 
     @unittest.skip(reason="We cannot configure detectron2 to output a smaller backbone")
     def test_model_is_small(self):
@@ -506,6 +634,229 @@ class LayoutLMv2ModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCa
 
             for key in model_batched_output:
                 recursive_check(model_batched_output[key], model_row_output[key], model_name, key)
+    # we overwrite this as LayoutLMv2ForRelationExtraction is not supported
+    def test_headmasking(self):
+        if not self.test_head_masking:
+            return
+
+        global_rng = random.Random()
+
+        global_rng.seed(42)
+        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
+        global_rng.seed()
+
+        inputs_dict["output_attentions"] = True
+        config.output_hidden_states = True
+        configs_no_init = _config_zero_init(config)  # To be sure we have no Nan
+        for model_class in self.all_model_classes:
+            if model_class.__name__ == "LayoutLMv2ForRelationExtraction":
+                continue
+
+            model = model_class(config=configs_no_init)
+            model.to(torch_device)
+            model.eval()
+
+            # Prepare head_mask
+            # Set require_grad after having prepared the tensor to avoid error (leaf variable has been moved into the graph interior)
+            head_mask = torch.ones(
+                self.model_tester.num_hidden_layers,
+                self.model_tester.num_attention_heads,
+                device=torch_device,
+            )
+            head_mask[0, 0] = 0
+            head_mask[-1, :-1] = 0
+            head_mask.requires_grad_(requires_grad=True)
+            inputs = self._prepare_for_class(inputs_dict, model_class).copy()
+            inputs["head_mask"] = head_mask
+            outputs = model(**inputs, return_dict=True)
+
+            # Test that we can get a gradient back for importance score computation
+            output = sum(t.sum() for t in outputs[0])
+            output = output.sum()
+            output.backward()
+            multihead_outputs = head_mask.grad
+
+            self.assertIsNotNone(multihead_outputs)
+            self.assertEqual(len(multihead_outputs), self.model_tester.num_hidden_layers)
+
+            def check_attentions_validity(attentions):
+                # Remove Nan
+                for t in attentions:
+                    self.assertLess(
+                        torch.sum(torch.isnan(t)), t.numel() / 4
+                    )  # Check we don't have more than 25% nans (arbitrary)
+                attentions = [
+                    t.masked_fill(torch.isnan(t), 0.0) for t in attentions
+                ]  # remove them (the test is less complete)
+
+                self.assertAlmostEqual(attentions[0][..., 0, :, :].flatten().sum().item(), 0.0)
+                self.assertNotEqual(attentions[0][..., -1, :, :].flatten().sum().item(), 0.0)
+                if len(attentions) > 2:  # encoder-decoder models have only 2 layers in each module
+                    self.assertNotEqual(attentions[1][..., 0, :, :].flatten().sum().item(), 0.0)
+                self.assertAlmostEqual(attentions[-1][..., -2, :, :].flatten().sum().item(), 0.0)
+                self.assertNotEqual(attentions[-1][..., -1, :, :].flatten().sum().item(), 0.0)
+
+            check_attentions_validity(outputs.attentions)
+
+    # we overwrite this as LayoutLMv2 requires special inputs + LayoutLMv2ForRelationExtraction is not supported
+    def _create_and_check_torchscript(self, config, inputs_dict):
+        if not self.test_torchscript:
+            return
+
+        configs_no_init = _config_zero_init(config)  # To be sure we have no Nan
+        configs_no_init.torchscript = True
+        for model_class in self.all_model_classes:
+            if model_class.__name__ == "LayoutLMv2ForRelationExtraction":
+                continue
+
+            model = model_class(config=configs_no_init)
+            model.to(torch_device)
+            model.eval()
+            inputs = self._prepare_for_class(inputs_dict, model_class)
+
+            try:
+                input_ids = inputs["input_ids"]
+                bbox = inputs["bbox"]
+                image = inputs["image"].tensor
+                traced_model = torch.jit.trace(
+                    model, (input_ids, bbox, image), check_trace=False
+                )  # when traced model is checked, an error is produced due to name mangling
+            except RuntimeError:
+                self.fail("Couldn't trace module.")
+
+            with tempfile.TemporaryDirectory() as tmp_dir_name:
+                pt_file_name = os.path.join(tmp_dir_name, "traced_model.pt")
+
+                try:
+                    torch.jit.save(traced_model, pt_file_name)
+                except Exception:
+                    self.fail("Couldn't save module.")
+
+                try:
+                    loaded_model = torch.jit.load(pt_file_name)
+                except Exception:
+                    self.fail("Couldn't load module.")
+
+            model.to(torch_device)
+            model.eval()
+
+            loaded_model.to(torch_device)
+            loaded_model.eval()
+
+            model_state_dict = model.state_dict()
+            loaded_model_state_dict = loaded_model.state_dict()
+
+            non_persistent_buffers = {}
+            for key in loaded_model_state_dict.keys():
+                if key not in model_state_dict.keys():
+                    non_persistent_buffers[key] = loaded_model_state_dict[key]
+
+            loaded_model_state_dict = {
+                key: value for key, value in loaded_model_state_dict.items() if key not in non_persistent_buffers
+            }
+
+            self.assertEqual(set(model_state_dict.keys()), set(loaded_model_state_dict.keys()))
+
+            model_buffers = list(model.buffers())
+            for non_persistent_buffer in non_persistent_buffers.values():
+                found_buffer = False
+                for i, model_buffer in enumerate(model_buffers):
+                    if torch.equal(non_persistent_buffer, model_buffer):
+                        found_buffer = True
+                        break
+
+                self.assertTrue(found_buffer)
+                model_buffers.pop(i)
+
+            models_equal = True
+            for layer_name, p1 in model_state_dict.items():
+                if layer_name in loaded_model_state_dict:
+                    p2 = loaded_model_state_dict[layer_name]
+                    if p1.data.ne(p2.data).sum() > 0:
+                        models_equal = False
+
+            self.assertTrue(models_equal)
+
+            # Avoid memory leak. Without this, each call increase RAM usage by ~20MB.
+            # (Even with this call, there are still memory leak by ~0.04MB)
+            self.clear_torch_jit_class_registry()
+
+    # overwrite as LayoutLMv2ForRelationExtraction outputs dictonaries containing integers rather than tensors
+    def test_model_outputs_equivalence(self):
+        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
+
+        def set_nan_tensor_to_zero(t):
+            t[t != t] = 0
+            return t
+
+        def check_equivalence(model, tuple_inputs, dict_inputs, additional_kwargs={}):
+            with torch.no_grad():
+                tuple_output = model(**tuple_inputs, return_dict=False, **additional_kwargs)
+                dict_output = model(**dict_inputs, return_dict=True, **additional_kwargs).to_tuple()
+
+                def recursive_check(tuple_object, dict_object):
+                    if isinstance(tuple_object, (List, Tuple)):
+                        for tuple_iterable_value, dict_iterable_value in zip(tuple_object, dict_object):
+                            recursive_check(tuple_iterable_value, dict_iterable_value)
+                    elif isinstance(tuple_object, Dict):
+                        for tuple_iterable_value, dict_iterable_value in zip(
+                            tuple_object.values(), dict_object.values()
+                        ):
+                            recursive_check(tuple_iterable_value, dict_iterable_value)
+                    elif tuple_object is None:
+                        return
+                    elif isinstance(tuple_object, int):
+                        self.assertEqual(tuple_object, dict_object)
+                    else:
+                        self.assertTrue(
+                            torch.allclose(
+                                set_nan_tensor_to_zero(tuple_object), set_nan_tensor_to_zero(dict_object), atol=1e-5
+                            ),
+                            msg=(
+                                "Tuple and dict output are not equal. Difference:"
+                                f" {torch.max(torch.abs(tuple_object - dict_object))}. Tuple has `nan`:"
+                                f" {torch.isnan(tuple_object).any()} and `inf`: {torch.isinf(tuple_object)}. Dict has"
+                                f" `nan`: {torch.isnan(dict_object).any()} and `inf`: {torch.isinf(dict_object)}."
+                            ),
+                        )
+
+                recursive_check(tuple_output, dict_output)
+
+        for model_class in self.all_model_classes:
+            model = model_class(config)
+            model.to(torch_device)
+            model.eval()
+
+            tuple_inputs = self._prepare_for_class(inputs_dict, model_class)
+            dict_inputs = self._prepare_for_class(inputs_dict, model_class)
+            check_equivalence(model, tuple_inputs, dict_inputs)
+
+            tuple_inputs = self._prepare_for_class(inputs_dict, model_class, return_labels=True)
+            dict_inputs = self._prepare_for_class(inputs_dict, model_class, return_labels=True)
+            check_equivalence(model, tuple_inputs, dict_inputs)
+
+            tuple_inputs = self._prepare_for_class(inputs_dict, model_class)
+            dict_inputs = self._prepare_for_class(inputs_dict, model_class)
+            check_equivalence(model, tuple_inputs, dict_inputs, {"output_hidden_states": True})
+
+            tuple_inputs = self._prepare_for_class(inputs_dict, model_class, return_labels=True)
+            dict_inputs = self._prepare_for_class(inputs_dict, model_class, return_labels=True)
+            check_equivalence(model, tuple_inputs, dict_inputs, {"output_hidden_states": True})
+
+            if self.has_attentions:
+                tuple_inputs = self._prepare_for_class(inputs_dict, model_class)
+                dict_inputs = self._prepare_for_class(inputs_dict, model_class)
+                check_equivalence(model, tuple_inputs, dict_inputs, {"output_attentions": True})
+
+                tuple_inputs = self._prepare_for_class(inputs_dict, model_class, return_labels=True)
+                dict_inputs = self._prepare_for_class(inputs_dict, model_class, return_labels=True)
+                check_equivalence(model, tuple_inputs, dict_inputs, {"output_attentions": True})
+
+                tuple_inputs = self._prepare_for_class(inputs_dict, model_class, return_labels=True)
+                dict_inputs = self._prepare_for_class(inputs_dict, model_class, return_labels=True)
+                check_equivalence(
+                    model, tuple_inputs, dict_inputs, {"output_hidden_states": True, "output_attentions": True}
+                )
 
 
 def prepare_layoutlmv2_batch_inputs():

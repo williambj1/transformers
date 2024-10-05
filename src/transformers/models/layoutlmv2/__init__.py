@@ -59,6 +59,7 @@ else:
         "LayoutLMv2Layer",
         "LayoutLMv2Model",
         "LayoutLMv2PreTrainedModel",
+        "LayoutLMv2ForRelationExtraction",
     ]
 
 if TYPE_CHECKING:
@@ -90,6 +91,7 @@ if TYPE_CHECKING:
     else:
         from .modeling_layoutlmv2 import (
             LayoutLMv2ForQuestionAnswering,
+            LayoutLMv2ForRelationExtraction,
             LayoutLMv2ForSequenceClassification,
             LayoutLMv2ForTokenClassification,
             LayoutLMv2Layer,
